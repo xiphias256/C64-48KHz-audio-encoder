@@ -28,7 +28,7 @@ The script take most audiofiles and videofiles as input (whatever ffmeg supports
 Now featuring different samplerates to increase playtime at the expence of quality.
 Have added 16KHz (1/3 samplerate) and 24Khz mode (1/2 samplerate)
   - quality 1 : 48KHz, aprox. 83s playback (default)
-  - quality 2 : 24Khz, aprox. 161s playback
+  - quality 2 : 24KHz, aprox. 161s playback
   - quality 3 : 16KHz, aprox. 248s playback
 
 If the input audio is longer than what is supported within the limits of the 1MB cartridge and the given samplerate, the audio is cut.
@@ -54,5 +54,5 @@ options:
   --sid {6581,8580}  SID chip model for amplitude table (default: 6581)
   --ntsc             Use NTSC clock (1022727 Hz) instead of PAL (985248 Hz)
   --quality {1,2,3}  1=48kHz/~82s 2=24kHz/~165s 3=16kHz/~248s (default: 1)
-  --mu MU            µ-law companding coefficient, 0=off (default: 100)
+  --mu MU            µ-law companding coefficient, 0=off (range 0-255, default: 0)
 ```
