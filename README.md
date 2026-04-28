@@ -32,7 +32,7 @@ The playback loop is cycle-exact — every path between consecutive D418 writes 
 
   | Quality | Cycles | Sample Rate | Max Duration | Player Design |
   |---------|--------|-------------|--------------|---------------|
-  | 1 (default) | 21 | ~47 kHz | ~83 s | 60 unrolled play blocks |
+  | 1 (default) | 21 | ~48 kHz | ~83 s | 60 unrolled play blocks |
   | 2 | 41 | ~24 kHz | ~161 s | Unrolled blocks + JSR delay |
   | 3 | 63 | ~16 kHz | ~248 s | Unrolled blocks + JSR delay |
 
