@@ -1,58 +1,109 @@
-# C64-48KHz-audio-encoder
-Encodes audio into an EasyFlash cartridge image (.crt) (1MB) that plays back at ~48 kHz on a stock Commodore 64 or Vice emulator
+# C64 48 KHz Digital Audio Encoder
 
-This Python script is made to replicate the excellent work of Antonio Savona, who made
-- [C64 48Khz HiFi Digi Player 1](https://csdb.dk/release/?id=162941)
-- [C64 48Khz HiFi Digi Player 2](https://csdb.dk/release/?id=162951)
+Encodes audio into an EasyFlash cartridge image (.crt) that plays back at up to ~48 kHz on a stock Commodore 64 using the SID chip's D418 volume register technique.
 
-His writeup of how he managed to make those cartridges is found [here](https://brokenbytes.blogspot.com/2018/03/a-48khz-digital-music-player-for.html).
+This Python script replicates and extends the work of **Antonio Savona (tonysavon)**, who created the original 48 kHz HiFi digital music players for the C64:
 
-The technical description of the C64 demo RUN/STOP by Pex 'Mahoney' Tufvesson, 
-was also crutial in understanding how to manipulate the SID chip. 
-His writeup of the RUN/STOP demo is found [here](https://livet.se/mahoney/c64-files/Musik_RunStop_Technical_Details_by_Pex_Mahoney_Tufvesson_v2.pdf).
+- [C64 48 KHz HiFi Digi Player 1](https://csdb.dk/release/?id=162941)
+- [C64 48 KHz HiFi Digi Player 2](https://csdb.dk/release/?id=162951)
+- [Technical writeup](https://brokenbytes.blogspot.com/2018/03/a-48khz-digital-music-player-for.html)
 
-## Key features of the script:
-  - 4:1 vector quantization with per-bank codebooks (256 x 4-sample vectors)
-  - Two-stage VQ: DPCM-sqrt clustering for perceptual quality, centroids on A
-  - Mahoney amplitude tables for both SID 6581 and 8580 (measured by Pex Tufvesson)
-  - Quantization-aware refinement with TPDF dither
-  - µ-law companding to boost quiet passage resolution, value in the range 0-255
-  - RMS normalization with soft limiting for optimal dynamic range
-  - Three quality modes: 48kHz/21cy, 24kHz/42cy, 16kHz/63cy
-  - Quality 1: 21-cycle exact unrolled playback loop (~82s)
-  - Quality 2/3: JSR delay subroutine for exact 42/63-cycle timing (~165/248s)
-  - Screen blanked during playback to prevent VIC-II badline cycle stealing
+The playback technique is based on **Pex "Mahoney" Tufvesson's** groundbreaking work on 8-bit sample playback through the SID's volume register, documented in his [RUN/STOP technical details (PDF)](https://livet.se/mahoney/c64-files/Musik_RunStop_Technical_Details_by_Pex_Mahoney_Tufvesson_v2.pdf).
 
-## General information
-The script take most audiofiles and videofiles as input (whatever ffmeg supports).
-Now featuring different samplerates to increase playtime at the expence of quality.
-Have added 16KHz (1/3 samplerate) and 24Khz mode (1/2 samplerate)
-  - quality 1 : 48KHz, aprox. 83s playback (default)
-  - quality 2 : 24KHz, aprox. 161s playback
-  - quality 3 : 16KHz, aprox. 248s playback
+## How It Works
 
-If the input audio is longer than what is supported within the limits of the 1MB cartridge and the given samplerate, the audio is cut.
-µ-law usage seems to generate harsh audio with clipping. Needs more investigation
+The encoder uses **vector quantization (VQ)** to compress audio into a format that the C64 can decompress and play in real time. Each audio sample is written to the SID chip's volume register ($D418) at a fixed rate, producing analog audio output through the chip's DAC coupling.
+
+The playback loop is cycle-exact — every path between consecutive D418 writes takes the same number of CPU cycles, ensuring jitter-free output. The screen is blanked during playback to prevent VIC-II badline cycle stealing.
+
+## Features
+
+### Encoding
+- **4:1 vector quantization** with per-bank codebooks (256 entries × 4 samples each)
+- **Two-stage VQ pipeline**: clusters on DPCM-sqrt signal for perceptual weighting, recomputes centroids on the original waveform (as described in tonysavon's writeup)
+- **Quantization-aware refinement** (5 rounds) with TPDF dither to minimize encode/decode mismatch
+- **Mahoney amplitude tables** for both SID 6581 and 8580, measured by Pex Tufvesson (2014)
+- **µ-law companding** (optional) to boost quiet passage resolution
+- **High-quality resampling** via scipy polyphase filter
+- Accepts any audio/video format supported by ffmpeg
+
+### Playback
+- **Three quality/duration modes** on a 1 MB EasyFlash cartridge:
+
+  | Quality | Cycles | Sample Rate | Max Duration | Player Design |
+  |---------|--------|-------------|--------------|---------------|
+  | 1 (default) | 21 | ~47 kHz | ~83 s | 60 unrolled play blocks |
+  | 2 | 41 | ~24 kHz | ~161 s | Unrolled blocks + JSR delay |
+  | 3 | 63 | ~16 kHz | ~248 s | Unrolled blocks + JSR delay |
+
+- **Cycle-exact timing** on all 5 inter-sample paths (verified)
+- **Screen blanking** to eliminate VIC-II badline interference
+- Supports both **PAL** (985248 Hz) and **NTSC** (1022727 Hz) clock rates
 
 ## Setup
-1. Create a virtual environment: `python3 -m venv venv`
-2. Activate it: `source venv/bin/activate` (or `.\venv\Scripts\activate` on Windows)
-3. Install dependencies: `pip install -r requirements.txt`
 
-External dependency: ffmpeg, install with apt/dnf, or other suitable packagemanagers
+### Prerequisites
+- Python 3.8+
+- ffmpeg (install via your system package manager)
+
+### Installation
+```bash
+python3 -m venv venv
+source venv/bin/activate        # Linux/macOS
+# .\venv\Scripts\activate       # Windows
+pip install -r requirements.txt
+```
 
 ## Usage
-```
-usage: c64_easyflash_encoder.py [-h] [--sid {6581,8580}] [--ntsc] [--quality {1,2,3}] [--mu MU] input [output]
 
-Arguments:
-  input              Input audio file (MP3, WAV, FLAC, MP4, etc.)
-  output             Output CRT file (default: output.crt)
-
-options:
-  -h, --help         show this help message and exit
-  --sid {6581,8580}  SID chip model for amplitude table (default: 6581)
-  --ntsc             Use NTSC clock (1022727 Hz) instead of PAL (985248 Hz)
-  --quality {1,2,3}  1=48kHz/~82s 2=24kHz/~165s 3=16kHz/~248s (default: 1)
-  --mu MU            µ-law companding coefficient, 0=off (range 0-255, default: 0)
 ```
+python c64_easyflash_encoder.py input [output] [options]
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `input` | Input audio or video file (MP3, WAV, FLAC, MP4, etc.) |
+| `output` | Output CRT file (default: `output.crt`) |
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--sid {6581,8580}` | `6581` | SID chip model for the Mahoney amplitude table |
+| `--ntsc` | off | Use NTSC clock instead of PAL |
+| `--quality {1,2,3}` | `1` | Sample rate / duration tradeoff (see table above) |
+| `--mu MU` | `0` | µ-law companding coefficient (0 = off, 255 = maximum) |
+
+### Examples
+
+```bash
+# Default: 48 kHz, SID 6581, PAL
+python c64_easyflash_encoder.py song.mp3 song.crt
+
+# Lower quality for longer playback
+python c64_easyflash_encoder.py song.mp3 song.crt --quality 3
+
+# For SID 8580 machines
+python c64_easyflash_encoder.py song.mp3 song.crt --sid 8580
+
+# NTSC with companding for quieter passages
+python c64_easyflash_encoder.py song.mp3 song.crt --ntsc --mu 100
+
+# Extract audio from a video file
+python c64_easyflash_encoder.py concert.mp4 concert.crt --quality 2
+```
+
+## Notes
+
+- If the input audio exceeds the maximum duration for the selected quality mode, it is truncated to fit the 1 MB cartridge.
+- The `--mu` parameter controls µ-law companding intensity. Higher values boost quiet passages more aggressively, which can improve perceived quality on material with wide dynamic range. Off by default. Try `--mu 100` as a starting point.
+- The `--sid` option selects which Mahoney amplitude lookup table to bake into the cartridge. Use `6581` for the original SID chip and `8580` for the later revision. Using the wrong table will produce distorted audio on real hardware. In VICE, match the SID model configured in Settings → SID.
+- Quality 2 and 3 use a JSR delay subroutine to extend the cycle count between D418 writes. The audio is resampled to the lower rate, so pitch remains correct.
+
+## Credits
+
+- **Antonio Savona (tonysavon)** — original 48 kHz VQ player design and encoder algorithm
+- **Pex "Mahoney" Tufvesson** — SID D418 8-bit sample playback technique and amplitude measurements
+- **Tim Henson** - Idea and code example for 1/3 samplerate (16KHz)
