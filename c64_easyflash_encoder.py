@@ -1,19 +1,24 @@
 """
-MP3/WAV -> C64 EasyFlash CRT encoder (48 kHz VQ player)
+MP3/WAV/FLAC -> C64 EasyFlash CRT encoder (VQ player, multi-quality)
 
 Encodes audio into an EasyFlash cartridge image (.crt) that plays back
-at ~47 kHz on a stock Commodore 64 using the Mahoney 8-bit D418 technique.
+on a stock Commodore 64 using the Mahoney 8-bit D418 technique.
 
 Key features:
   - 4:1 vector quantization with per-bank codebooks (256 x 4-sample vectors)
   - Two-stage VQ: DPCM-sqrt clustering for perceptual quality, centroids on A
   - Mahoney amplitude tables for both SID 6581 and 8580 (measured by Pex Tufvesson)
   - Quantization-aware refinement with TPDF dither
-  - 21-cycle exact unrolled playback loop (all paths verified)
-  - Pre-emphasis filter to boost HF content before VQ encoding
+  - µ-law companding to boost quiet passage resolution
+  - RMS normalization with soft limiting for optimal dynamic range
+  - Three quality modes: 48kHz/21cy, 24kHz/42cy, 16kHz/63cy
+  - Quality 1: 21-cycle exact unrolled playback loop (~82s)
+  - Quality 2/3: JSR delay subroutine for exact 42/63-cycle timing (~165/248s)
+  - Screen blanked during playback to prevent VIC-II badline cycle stealing
 
 Usage:
-  python c64_easyflash_encoder.py input.mp3 [output.crt] [--sid 6581|8580] [--ntsc]
+  python c64_easyflash_encoder.py input.mp3 [output.crt]
+    [--sid 6581|8580] [--ntsc] [--quality 1|2|3] [--mu 100]
 """
 
 import sys
@@ -24,7 +29,6 @@ import numpy as np
 from pydub import AudioSegment
 from sklearn.cluster import KMeans
 from scipy.signal import resample_poly
-from scipy.ndimage import uniform_filter1d
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -47,8 +51,9 @@ STREAM_PAGES_ROMH     = ROMH_STREAM_LEN // 256   # 32
 STREAM_PAGES_PER_BANK = STREAM_PAGES_ROML + STREAM_PAGES_ROMH  # 60
 STREAM_PAGE_HIS       = list(range(0x84, 0xA0)) + list(range(0xA0, 0xC0))
 QUANT_REFINE_ROUNDS   = 5
-PRE_EMPHASIS_COEFF    = 0            # high-pass pre-emphasis: y[n] = x[n] - coeff*x[n-1]
-                                     # 0=disable , 0.95=full filter applied
+KMEANS_N_INIT         = 20           # number of K-means restarts (was 10)
+KMEANS_MAX_ITER       = 500          # max iterations per restart (was 300)
+MU_LAW_DEFAULT        = 0            # µ-law companding coefficient (default=0=off, max=255)
 
 # ---------------------------------------------------------------------------
 # MAHONEY SID AMPLITUDE TABLES
@@ -170,22 +175,34 @@ def load_audio(path, sample_rate):
     # Normalize to -1..+1
     peak = np.max(np.abs(samples))
     if peak > 0:
-        samples = samples / peak * 0.98
+        samples = samples / peak
     return samples.astype(np.float32)
 
-def apply_pre_emphasis(samples):
-    """Apply a simple first-order high-pass pre-emphasis filter.
-    Boosts high frequencies before VQ encoding. The SID's natural
-    low-pass rolloff partially compensates on playback, reducing
-    perceived noise in the highs."""
-    out = np.empty_like(samples)
-    out[0] = samples[0]
-    out[1:] = samples[1:] - PRE_EMPHASIS_COEFF * samples[:-1]
-    # Re-normalize after pre-emphasis to avoid clipping
-    peak = np.max(np.abs(out))
+def normalize_audio(samples, headroom=0.90):
+    """Peak normalize with headroom to keep signal within the Mahoney LUT's
+    well-behaved range. Headroom of 0.90 means peaks reach ±0.90, leaving
+    margin at the edges of the D418 range where quantization is coarsest."""
+    peak = np.max(np.abs(samples))
     if peak > 0:
-        out = out / peak * 0.98
-    return out
+        samples = samples * (headroom / peak)
+    return samples.astype(np.float32)
+
+def mu_law_compress(samples, mu=100):
+    """Apply µ-law compression to boost quiet passages.
+    µ=0 is linear (no compression), µ=255 is standard telephony.
+    µ=100 is a good default for music — boosts quiet content ~5x
+    without making loud content sound squashed.
+    Output is re-normalized to prevent clipping at the LUT edges."""
+    if mu <= 0:
+        return samples
+    compressed = (np.sign(samples) * np.log1p(mu * np.abs(samples))
+                  / np.log1p(mu)).astype(np.float32)
+    # Re-normalize: µ-law pushes values toward ±1, which would clip
+    # at the edges of the Mahoney LUT. Scale back with headroom.
+    peak = np.max(np.abs(compressed))
+    if peak > 0:
+        compressed = compressed * (0.90 / peak)
+    return compressed
 
 def make_vectors(samples):
     """Reshape sample array into (N, VECTOR_SIZE) matrix, trimming excess."""
@@ -232,7 +249,7 @@ def train_codebook(vectors, raw_signal, label=""):
     bvecs = b[:len(vectors) * VECTOR_SIZE].reshape(-1, VECTOR_SIZE)
 
     # Step 2: cluster in B-space
-    km = KMeans(n_clusters=K, n_init=10, max_iter=300, random_state=0)
+    km = KMeans(n_clusters=K, n_init=KMEANS_N_INIT, max_iter=KMEANS_MAX_ITER, random_state=0)
     km.fit(bvecs)
 
     # Step 3: recompute centroids on A
@@ -326,52 +343,93 @@ def emit_sid_init(a):
     a.LDA_imm(0x03); a.STA_abs(0xD417)
     a.LDA_imm(0x00); a.STA_abs(0xD418)
 
-# ---------------------------------------------------------------------------
-# UNROLLED PLAY BLOCKS (60 x 64 bytes = 3840 bytes)
-# ---------------------------------------------------------------------------
-# All paths between consecutive STA $D418 writes = exactly 21 cycles.
 
-def make_unrolled_play_blocks(blocks_base, sid_addr, bank_done_addr):
-    assert blocks_base % 64 == 0 and sid_addr % 256 == 0
+# ---------------------------------------------------------------------------
+# UNROLLED PLAY BLOCKS
+# ---------------------------------------------------------------------------
+# Quality 1 (21cy): 60 x 64-byte blocks, no delay subroutine.
+# Quality 2 (42cy): 60 x 80-byte blocks + 21cy JSR delay subroutine.
+# Quality 3 (63cy): 60 x 80-byte blocks + 42cy JSR delay subroutine.
+# The JSR trick inserts identical extra cycles into all 5 inter-STA paths,
+# preserving the exact timing balance of the proven 21cy design.
+
+BLOCK_STRIDE_21 = 64
+BLOCK_STRIDE_LO = 80
+
+def make_delay_subroutine(extra_cycles):
+    """Build a delay subroutine that consumes exactly extra_cycles total
+    (including JSR 6cy + RTS 6cy overhead)."""
+    body_cy = extra_cycles - 12
+    assert body_cy >= 0
+    sub = bytearray()
+    r = body_cy
+    if r % 2 != 0:
+        # Need an odd number of cycles. Use PHA(3)+PLA(4)=7cy
+        # instead of BIT $EA(3) to avoid reading ZP addresses.
+        sub.extend([0x48, 0x68])  # PHA + PLA = 7cy, 2 bytes
+        r -= 7
+    while r >= 2:
+        sub.append(0xEA)  # NOP = 2cy
+        r -= 2
+    assert r == 0, f"Cannot build delay body for {body_cy} cycles"
+    sub.append(0x60)  # RTS
+    return bytes(sub)
+
+def make_unrolled_play_blocks(blocks_base, sid_addr, bank_done_addr,
+                              delay_addr=None, block_stride=64):
+    assert sid_addr % 256 == 0
     out = bytearray()
     for blk in range(STREAM_PAGES_PER_BANK):
         ph  = STREAM_PAGE_HIS[blk]
-        ba  = blocks_base + blk * 64
+        ba  = blocks_base + blk * block_stride
         sm  = ba + 2
-        nxt = (blocks_base + (blk + 1) * 64 + 1
+        nxt = (blocks_base + (blk + 1) * block_stride + 1
                if blk < STREAM_PAGES_PER_BANK - 1
                else bank_done_addr)
         s = sid_addr
-        b = bytearray(64)
-        b[0]  = 0xEA
-        b[1]  = 0xAE; b[2] = 0x00; b[3] = ph
-        b[4]  = 0xBC; b[5] = 0x00; b[6] = 0x80
-        b[7]  = 0xB9; b[8] = s & 0xFF; b[9] = s >> 8
-        b[10] = 0x8D; b[11] = 0x18; b[12] = 0xD4
-        b[13] = 0xEE; b[14] = sm & 0xFF; b[15] = sm >> 8
-        b[16] = 0x24; b[17] = 0xEA
-        b[18] = 0xBC; b[19] = 0x00; b[20] = 0x81
-        b[21] = 0xB9; b[22] = s & 0xFF; b[23] = s >> 8
-        b[24] = 0x8D; b[25] = 0x18; b[26] = 0xD4
-        b[27] = 0xEE; b[28] = 0x20; b[29] = 0xD0
-        b[30] = 0x24; b[31] = 0xEA
-        b[32] = 0xBC; b[33] = 0x00; b[34] = 0x82
-        b[35] = 0xB9; b[36] = s & 0xFF; b[37] = s >> 8
-        b[38] = 0x8D; b[39] = 0x18; b[40] = 0xD4
-        b[41] = 0x24; b[42] = 0xEA
-        b[43] = 0xEA
-        b[44] = 0xBC; b[45] = 0x00; b[46] = 0x83
-        b[47] = 0xB9; b[48] = s & 0xFF; b[49] = s >> 8
-        b[50] = 0xAC; b[51] = sm & 0xFF; b[52] = sm >> 8
-        b[53] = 0x8D; b[54] = 0x18; b[55] = 0xD4
-        b[56] = 0xD0; b[57] = (-58) & 0xFF
-        b[58] = 0x4C; b[59] = nxt & 0xFF; b[60] = nxt >> 8
-        b[61] = 0xEA; b[62] = 0xEA; b[63] = 0xEA
+        b = bytearray()
+        b.append(0xEA)                                     # NOP
+        b.extend([0xAE, 0x00, ph])                         # LDX $xxNN
+        b.extend([0xBC, 0x00, 0x80])                       # LDY $8000,X
+        b.extend([0xB9, s & 0xFF, s >> 8])                 # LDA sid,Y
+        b.extend([0x8D, 0x18, 0xD4])                       # STA $D418 [s0]
+        if delay_addr is not None:
+            b.extend([0x20, delay_addr & 0xFF, delay_addr >> 8])
+        b.extend([0xEE, sm & 0xFF, sm >> 8])               # INC sm
+        b.extend([0x24, 0xEA])                             # BIT $EA
+        b.extend([0xBC, 0x00, 0x81])                       # LDY $8100,X
+        b.extend([0xB9, s & 0xFF, s >> 8])                 # LDA sid,Y
+        b.extend([0x8D, 0x18, 0xD4])                       # STA $D418 [s1]
+        if delay_addr is not None:
+            b.extend([0x20, delay_addr & 0xFF, delay_addr >> 8])
+        b.extend([0xEE, 0x20, 0xD0])                       # INC $D020
+        b.extend([0x24, 0xEA])                             # BIT $EA
+        b.extend([0xBC, 0x00, 0x82])                       # LDY $8200,X
+        b.extend([0xB9, s & 0xFF, s >> 8])                 # LDA sid,Y
+        b.extend([0x8D, 0x18, 0xD4])                       # STA $D418 [s2]
+        if delay_addr is not None:
+            b.extend([0x20, delay_addr & 0xFF, delay_addr >> 8])
+        b.extend([0x24, 0xEA])                             # BIT $EA
+        b.append(0xEA)                                     # NOP
+        b.extend([0xBC, 0x00, 0x83])                       # LDY $8300,X
+        b.extend([0xB9, s & 0xFF, s >> 8])                 # LDA sid,Y
+        b.extend([0xAC, sm & 0xFF, sm >> 8])               # LDY sm
+        b.extend([0x8D, 0x18, 0xD4])                       # STA $D418 [s3]
+        if delay_addr is not None:
+            b.extend([0x20, delay_addr & 0xFF, delay_addr >> 8])
+        bne_pos = len(b)
+        b.extend([0xD0, 0x00])                             # BNE (patch)
+        rel = 0 - (bne_pos + 2)
+        assert -128 <= rel <= 127, f"BNE out of range in block {blk}: {rel}"
+        b[bne_pos + 1] = rel & 0xFF
+        b.extend([0x4C, nxt & 0xFF, nxt >> 8])             # JMP next
+        assert len(b) <= block_stride, f"Block {blk}: {len(b)} > {block_stride}"
+        b.extend([0xEA] * (block_stride - len(b)))
         out.extend(b)
-    assert len(out) == STREAM_PAGES_PER_BANK * 64
+    assert len(out) == STREAM_PAGES_PER_BANK * block_stride
     return bytes(out)
 
-def make_bank_done_handler(blocks_base, addr, num_banks):
+def make_bank_done_handler(blocks_base, addr, num_banks, block_stride=64):
     h = Asm(addr)
     h.LDX_zp(0x02); h.INX(); h.CPX_imm(num_banks + 1)
     h.BNE('go')
@@ -380,7 +438,7 @@ def make_bank_done_handler(blocks_base, addr, num_banks):
     h.STX_zp(0x02); h.STX_abs(0xDE00)
     for blk in range(STREAM_PAGES_PER_BANK):
         h.LDA_imm(0x00)
-        h.STA_abs(blocks_base + blk * 64 + 2)
+        h.STA_abs(blocks_base + blk * block_stride + 2)
     h.JMP_abs(blocks_base + 1)
     return h.bytes()
 
@@ -395,33 +453,42 @@ def make_player_init(blocks_base, sid_addr):
     p.JMP_abs(blocks_base + 1)
     return p.bytes()
 
-def build_player_blob(num_banks):
+def build_player_blob(num_banks, quality=1):
     """Assemble the complete player into a RAM blob ($0800 onward)."""
     BLOCKS = 0x0900
-    BDONE  = BLOCKS + STREAM_PAGES_PER_BANK * 64
-    SIDT   = ((BDONE + 512 + 255) & ~255)
-    assert BLOCKS % 64 == 0 and SIDT % 256 == 0
-
-    init   = make_player_init(BLOCKS, SIDT)
-    blocks = make_unrolled_play_blocks(BLOCKS, SIDT, BDONE)
-    done   = make_bank_done_handler(BLOCKS, BDONE, num_banks)
-    sid    = bytes(range(256))  # identity sidtable
-
-    assert len(done) <= 512
-
-    BLOB_START = PLAYER_RAM
-    BLOB_END   = SIDT + 256
-    blob = bytearray(BLOB_END - BLOB_START)
-
-    def place(addr, data):
-        o = addr - BLOB_START
-        assert 0 <= o and o + len(data) <= len(blob)
-        blob[o:o + len(data)] = data
-
-    place(PLAYER_RAM, init)
-    place(BLOCKS, blocks)
-    place(BDONE, done)
-    place(SIDT, sid)
+    if quality == 1:
+        stride = BLOCK_STRIDE_21
+        BDONE = BLOCKS + STREAM_PAGES_PER_BANK * stride
+        SIDT  = ((BDONE + 512 + 255) & ~255)
+        assert SIDT % 256 == 0
+        init   = make_player_init(BLOCKS, SIDT)
+        blocks = make_unrolled_play_blocks(BLOCKS, SIDT, BDONE,
+                                           delay_addr=None, block_stride=stride)
+        done   = make_bank_done_handler(BLOCKS, BDONE, num_banks, stride)
+        sid    = bytes(range(256))
+        BLOB_END = SIDT + 256
+        blob = bytearray(BLOB_END - PLAYER_RAM)
+        def place(a, d): blob[a - PLAYER_RAM:a - PLAYER_RAM + len(d)] = d
+        place(PLAYER_RAM, init); place(BLOCKS, blocks)
+        place(BDONE, done); place(SIDT, sid)
+    else:
+        extra_cy = {2: 20, 3: 42}[quality]
+        stride = BLOCK_STRIDE_LO
+        BDONE  = BLOCKS + STREAM_PAGES_PER_BANK * stride
+        DELAY  = BDONE + 512
+        delay  = make_delay_subroutine(extra_cy)
+        SIDT   = ((DELAY + len(delay) + 255) & ~255)
+        assert SIDT % 256 == 0
+        init   = make_player_init(BLOCKS, SIDT)
+        blocks = make_unrolled_play_blocks(BLOCKS, SIDT, BDONE,
+                                           delay_addr=DELAY, block_stride=stride)
+        done   = make_bank_done_handler(BLOCKS, BDONE, num_banks, stride)
+        sid    = bytes(range(256))
+        BLOB_END = SIDT + 256
+        blob = bytearray(BLOB_END - PLAYER_RAM)
+        def place(a, d): blob[a - PLAYER_RAM:a - PLAYER_RAM + len(d)] = d
+        place(PLAYER_RAM, init); place(BLOCKS, blocks)
+        place(BDONE, done); place(DELAY, delay); place(SIDT, sid)
     return bytes(blob), BLOCKS, BDONE, SIDT
 
 # ---------------------------------------------------------------------------
@@ -430,30 +497,42 @@ def build_player_blob(num_banks):
 
 def make_copy_stub(player_size):
     pages = math.ceil(player_size / 256)
-    assert pages <= 20
-    stub = bytearray([0xA2, 0x00])
-    loop = len(stub)
-    for p in range(pages):
-        stub.extend([0xBD, 0x80, 0x80 + p, 0x9D, 0x00, 0x08 + p])
-    stub.append(0xE8)
-    stub.extend([0xD0, (loop - len(stub) - 2) & 0xFF])
-    stub.extend([0x4C, 0x00, 0x08])
-    stub.extend(b'\x00' * (0x80 - len(stub)))
-    return bytes(stub[:0x80])
+    if pages <= 20:
+        stub = bytearray([0xA2, 0x00])
+        loop = len(stub)
+        for p in range(pages):
+            stub.extend([0xBD, 0x80, 0x80 + p, 0x9D, 0x00, 0x08 + p])
+        stub.append(0xE8)
+        stub.extend([0xD0, (loop - len(stub) - 2) & 0xFF])
+        stub.extend([0x4C, 0x00, 0x08])
+        stub.extend(b'\x00' * (0x80 - len(stub)))
+        return bytes(stub[:0x80])
+    else:
+        assert pages <= 31, f"Player too large: {pages} pages (max 31)"
+        SRC_LO, SRC_HI, DST_LO, DST_HI = 0xFB, 0xFC, 0xFD, 0xFE
+        stub = bytearray([
+            0xA9, 0x80, 0x85, SRC_LO, 0x85, SRC_HI,
+            0xA9, 0x00, 0x85, DST_LO,
+            0xA9, 0x08, 0x85, DST_HI,
+            0xA0, 0x00, 0xA2, pages,
+            0xB1, SRC_LO, 0x91, DST_LO, 0xC8, 0xD0, 0xF9,
+            0xE6, SRC_HI, 0xE6, DST_HI, 0xCA, 0xD0, 0xF2,
+            0x4C, 0x00, 0x08,
+        ])
+        stub.extend(b'\x00' * (0x80 - len(stub)))
+        return bytes(stub[:0x80])
 
 def make_kernal_romh():
     romh = bytearray(CHIP_SIZE)
     code = bytearray([
         0x78, 0xA2, 0xFF, 0x9A, 0xD8,
         0xA9, 0x08, 0x8D, 0x16, 0xD0,
-        0x9D, 0x00, 0x01, 0xCA, 0xD0, 0xFB,
-        0xA2, 0x3E,
+        0x9D, 0x00, 0x01, 0xCA, 0xD0, 0xFB, 0xA2, 0x3E,
     ])
     loop_off = len(code)
     code.extend([0xBD, 0x1E, 0xE0, 0x9D, 0x00, 0x01, 0xCA])
     code.extend([0x10, (loop_off - len(code) - 2) & 0xFF, 0x4C, 0x00, 0x01])
-    while len(code) < 0x1E:
-        code.insert(-3, 0xEA)
+    while len(code) < 0x1E: code.insert(-3, 0xEA)
     romh[0:len(code)] = code
     stub = bytearray([
         0xA9, 0x87, 0x8D, 0x02, 0xDE,
@@ -491,9 +570,9 @@ def crt_header():
     h[0:16] = b'C64 CARTRIDGE   '
     struct.pack_into('>I', h, 0x10, 0x40)
     struct.pack_into('>H', h, 0x14, 0x0100)
-    struct.pack_into('>H', h, 0x16, 0x0020)  # EasyFlash
+    struct.pack_into('>H', h, 0x16, 0x0020)
     h[0x18] = 0x01; h[0x19] = 0x00
-    h[0x20:0x40] = b'C64 48KHZ VQ PLAYER'.ljust(0x20, b'\x00')
+    h[0x20:0x40] = b'C64 VQ PLAYER'.ljust(0x20, b'\x00')
     return bytes(h)
 
 def chip_packet(bank, load_addr, data):
@@ -520,11 +599,15 @@ def assemble_audio_bank(cb_bytes, stream):
 # ENCODER
 # ---------------------------------------------------------------------------
 
-def encode_to_crt(input_file, output_file="output.crt", sid_model="6581", ntsc=False):
+def encode_to_crt(input_file, output_file="output.crt", sid_model="6581",
+                  ntsc=False, quality=1, mu=MU_LAW_DEFAULT):
     clock = NTSC_CLOCK if ntsc else PAL_CLOCK
-    sample_rate = clock // CYCLES_PER_SAMPLE
+    cycles = {1: 21, 2: 41, 3: 63}[quality]
+    sample_rate = clock // cycles
     system = "NTSC" if ntsc else "PAL"
-    print(f"System: {system} ({clock} Hz clock, {sample_rate} Hz sample rate)")
+    mode = {1: "48kHz/21cy", 2: "24kHz/41cy", 3: "16kHz/63cy"}[quality]
+    print(f"System: {system} ({clock} Hz clock)")
+    print(f"Quality {quality}: {mode}, {sample_rate} Hz sample rate")
 
     select_sid_model(sid_model)
     print(f"Loading: {input_file}")
@@ -532,10 +615,13 @@ def encode_to_crt(input_file, output_file="output.crt", sid_model="6581", ntsc=F
     duration = len(samples) / sample_rate
     print(f"  {len(samples)} samples ({duration:.1f}s)")
 
-    # Pre-emphasis
-    samples = apply_pre_emphasis(samples)
+    # Preprocessing: µ-law compress then normalize with headroom
+    if mu > 0:
+        print(f"  µ-law companding: µ={mu}")
+        samples = mu_law_compress(samples, mu)
+    else:
+        samples = normalize_audio(samples)
 
-    # Segment into banks
     all_vecs = make_vectors(samples)
     max_vecs = MAX_AUDIO_BANKS * STREAM_PER_BANK
     if len(all_vecs) > max_vecs:
@@ -547,10 +633,10 @@ def encode_to_crt(input_file, output_file="output.crt", sid_model="6581", ntsc=F
     audio_dur = total_vecs * VECTOR_SIZE / sample_rate
     print(f"  {total_vecs} vectors -> {n_banks} banks ({audio_dur:.1f}s)")
 
-    # Build player
     print("Building player...")
-    blob, blocks, bdone, sidt = build_player_blob(n_banks)
-    print(f"  {len(blob)} bytes, blocks=${blocks:04X} done=${bdone:04X} sid=${sidt:04X}")
+    blob, blocks, bdone, sidt = build_player_blob(n_banks, quality)
+    print(f"  {len(blob)} bytes ({math.ceil(len(blob)/256)} pages),"
+          f" blocks=${blocks:04X} done=${bdone:04X} sid=${sidt:04X}")
 
     stub = make_copy_stub(len(blob))
     roml0 = bytearray(CHIP_SIZE)
@@ -560,7 +646,6 @@ def encode_to_crt(input_file, output_file="output.crt", sid_model="6581", ntsc=F
         chunk = blob[pg * 256:(pg + 1) * 256]
         roml0[pg * 256 + 0x80:pg * 256 + 0x80 + len(chunk)] = chunk
 
-    # Assemble CRT
     print(f"Training {n_banks} per-bank codebooks...")
     crt = bytearray(crt_header())
     crt += chip_packet(0, 0x8000, bytes(roml0))
@@ -570,17 +655,14 @@ def encode_to_crt(input_file, output_file="output.crt", sid_model="6581", ntsc=F
     for i in range(n_banks):
         vs = i * STREAM_PER_BANK
         ve = min(vs + STREAM_PER_BANK, total_vecs)
-        bank_vecs = all_vecs[vs:ve]
-        bank_raw  = raw_aligned[vs * VECTOR_SIZE:ve * VECTOR_SIZE]
-
-        cb, labels = train_codebook(bank_vecs, bank_raw,
+        cb, labels = train_codebook(all_vecs[vs:ve],
+                                    raw_aligned[vs*VECTOR_SIZE:ve*VECTOR_SIZE],
                                     label=f"bank {i+1}/{n_banks}")
         cbq = float_to_d418(cb)
         cbb = interleave_codebook(cbq)
         stream = labels.astype(np.uint8)
         if len(stream) < STREAM_PER_BANK:
             stream = np.pad(stream, (0, STREAM_PER_BANK - len(stream)))
-
         ra, rh = assemble_audio_bank(cbb, stream)
         crt += chip_packet(i + 1, 0x8000, ra)
         crt += chip_packet(i + 1, 0xA000, rh)
@@ -595,7 +677,7 @@ def encode_to_crt(input_file, output_file="output.crt", sid_model="6581", ntsc=F
 
 def main():
     p = argparse.ArgumentParser(
-        description="Encode audio into a C64 EasyFlash CRT (48 kHz VQ player)")
+        description="Encode audio into a C64 EasyFlash CRT (VQ player)")
     p.add_argument("input", help="Input audio file (MP3, WAV, FLAC, etc.)")
     p.add_argument("output", nargs="?", default="output.crt",
                    help="Output CRT file (default: output.crt)")
@@ -603,12 +685,17 @@ def main():
                    help="SID chip model for amplitude table (default: 6581)")
     p.add_argument("--ntsc", action="store_true",
                    help="Use NTSC clock (1022727 Hz) instead of PAL (985248 Hz)")
+    p.add_argument("--quality", type=int, choices=[1, 2, 3], default=1,
+                   help="1=48kHz/~82s  2=24kHz/~165s  3=16kHz/~248s (default: 1)")
+    p.add_argument("--mu", type=int, default=MU_LAW_DEFAULT,
+                   help=f"µ-law companding coefficient, 0=off (default: {MU_LAW_DEFAULT})")
     args = p.parse_args()
-    encode_to_crt(args.input, args.output, sid_model=args.sid, ntsc=args.ntsc)
+    encode_to_crt(args.input, args.output, sid_model=args.sid,
+                  ntsc=args.ntsc, quality=args.quality, mu=args.mu)
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
         print("Usage: python c64_easyflash_encoder.py input [output.crt]"
-              " [--sid 6581|8580] [--ntsc]")
+              " [--sid 6581|8580] [--ntsc] [--quality 1|2|3] [--mu 100]")
         sys.exit(0)
     main()
