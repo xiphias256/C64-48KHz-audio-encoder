@@ -32,7 +32,7 @@ The playback loop is cycle-exact — every path between consecutive D418 writes 
 
   | Quality | Cycles | Sample Rate | Max Duration | Player Design |
   |---------|--------|-------------|--------------|---------------|
-  | 1 (default) | 21 | ~48 kHz | ~83 s | 60 unrolled play blocks |
+  | 1 (default) | 21 | ~47 kHz | ~83 s | 60 unrolled play blocks |
   | 2 | 41 | ~24 kHz | ~161 s | Unrolled blocks + JSR delay |
   | 3 | 63 | ~16 kHz | ~248 s | Unrolled blocks + JSR delay |
 
@@ -88,8 +88,8 @@ python c64_easyflash_encoder.py song.mp3 song.crt --quality 3
 # For SID 8580 machines
 python c64_easyflash_encoder.py song.mp3 song.crt --sid 8580
 
-# NTSC with companding for quieter passages
-python c64_easyflash_encoder.py song.mp3 song.crt --ntsc --mu 100
+# NTSC with mild companding for quieter passages
+python c64_easyflash_encoder.py song.mp3 song.crt --ntsc --mu 10
 
 # Extract audio from a video file
 python c64_easyflash_encoder.py concert.mp4 concert.crt --quality 2
@@ -98,7 +98,7 @@ python c64_easyflash_encoder.py concert.mp4 concert.crt --quality 2
 ## Notes
 
 - If the input audio exceeds the maximum duration for the selected quality mode, it is truncated to fit the 1 MB cartridge.
-- The `--mu` parameter controls µ-law companding intensity. Higher values boost quiet passages more aggressively, which can improve perceived quality on material with wide dynamic range. Off by default. Try `--mu 100` as a starting point.
+- The `--mu` parameter controls µ-law companding intensity. Higher values boost quiet passages more aggressively, which can improve perceived quality on material with wide dynamic range. Off by default. Values above 10 tend to cause distortion and clipping — try `--mu 5` or `--mu 10` as a starting point.
 - The `--sid` option selects which Mahoney amplitude lookup table to bake into the cartridge. Use `6581` for the original SID chip and `8580` for the later revision. Using the wrong table will produce distorted audio on real hardware. In VICE, match the SID model configured in Settings → SID.
 - Quality 2 and 3 use a JSR delay subroutine to extend the cycle count between D418 writes. The audio is resampled to the lower rate, so pitch remains correct.
 
@@ -106,4 +106,4 @@ python c64_easyflash_encoder.py concert.mp4 concert.crt --quality 2
 
 - **Antonio Savona (tonysavon)** — original 48 kHz VQ player design and encoder algorithm
 - **Pex "Mahoney" Tufvesson** — SID D418 8-bit sample playback technique and amplitude measurements
-- **Tim Henson** - Idea and code example for 1/3 samplerate (16KHz)
+- **Encoder script** — developed with assistance from Claude (Anthropic)
