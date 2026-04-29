@@ -1,5 +1,5 @@
 """
-MP3/WAV/FLAC -> C64 EasyFlash CRT encoder (VQ player, multi-quality)
+MP3/WAV -> C64 EasyFlash CRT encoder (VQ player, multi-quality)
 
 Encodes audio into an EasyFlash cartridge image (.crt) that plays back
 on a stock Commodore 64 using the Mahoney 8-bit D418 technique.
@@ -50,10 +50,10 @@ STREAM_PAGES_ROML     = ROML_STREAM_LEN // 256   # 28
 STREAM_PAGES_ROMH     = ROMH_STREAM_LEN // 256   # 32
 STREAM_PAGES_PER_BANK = STREAM_PAGES_ROML + STREAM_PAGES_ROMH  # 60
 STREAM_PAGE_HIS       = list(range(0x84, 0xA0)) + list(range(0xA0, 0xC0))
-QUANT_REFINE_ROUNDS   = 5
-KMEANS_N_INIT         = 20           # number of K-means restarts (was 10)
-KMEANS_MAX_ITER       = 500          # max iterations per restart (was 300)
-MU_LAW_DEFAULT        = 0            # µ-law companding coefficient (default=0=off, max=255)
+QUANT_REFINE_ROUNDS   = 8
+KMEANS_N_INIT         = 20           # number of K-means restarts
+KMEANS_MAX_ITER       = 500          # max iterations per restart
+MU_LAW_DEFAULT        = 0             # µ-law companding coefficient (0=off)
 
 # ---------------------------------------------------------------------------
 # MAHONEY SID AMPLITUDE TABLES
@@ -228,12 +228,16 @@ def recompute_centroids(vectors, labels):
         cb[mask, d] = sums[mask] / counts[mask]
     return cb.astype(np.float32), int(np.sum(counts == 0))
 
-def float_to_d418(cb):
-    """Float centroids (-1..+1) -> D418 values via Mahoney LUT with TPDF dither."""
-    # TPDF dither: triangular probability density, ±0.5 LSB
-    dither = (np.random.random(cb.shape).astype(np.float32)
-            + np.random.random(cb.shape).astype(np.float32) - 1.0) * (1.0 / 255.0)
-    linear = np.clip(np.round((cb + dither + 1.0) * 127.5), 0, 255).astype(np.uint8)
+def float_to_d418(cb, dither=True):
+    """Float centroids (-1..+1) -> D418 values via Mahoney LUT.
+    With dither=True (training): adds TPDF dither to break up quantization patterns.
+    With dither=False (final): deterministic rounding for the actual cartridge data."""
+    if dither:
+        d = (np.random.random(cb.shape).astype(np.float32)
+           + np.random.random(cb.shape).astype(np.float32) - 1.0) * (1.0 / 255.0)
+        linear = np.clip(np.round((cb + d + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    else:
+        linear = np.clip(np.round((cb + 1.0) * 127.5), 0, 255).astype(np.uint8)
     return MAHONEY_LUT[linear]
 
 def d418_to_float(d418_vals):
@@ -255,15 +259,15 @@ def train_codebook(vectors, raw_signal, label=""):
     # Step 3: recompute centroids on A
     cb, empty = recompute_centroids(vectors, km.labels_)
 
-    # Step 4: quantization-aware refinement
+    # Step 4: quantization-aware refinement (dithered during training)
     for _ in range(QUANT_REFINE_ROUNDS):
-        cbq = float_to_d418(cb)
+        cbq = float_to_d418(cb, dither=True)
         cb_dq = d418_to_float(cbq)
         labels = np.argmin(cdist(vectors, cb_dq, metric='sqeuclidean'), axis=1).astype(np.int32)
         cb, empty = recompute_centroids(vectors, labels)
 
-    # Final assignment with quantized codebook
-    cbq = float_to_d418(cb)
+    # Final assignment: deterministic quantization (no dither) for the actual cartridge
+    cbq = float_to_d418(cb, dither=False)
     cb_dq = d418_to_float(cbq)
     labels = np.argmin(cdist(vectors, cb_dq, metric='sqeuclidean'), axis=1).astype(np.int32)
 
