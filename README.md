@@ -1,6 +1,6 @@
 # C64 48 KHz Digital Audio Encoder
 
-Encodes audio into an EasyFlash cartridge image (.crt) that plays back at up to ~48 kHz on a stock Commodore 64 using the SID chip's D418 volume register technique.
+Encodes audio into an EasyFlash cartridge image (.crt) that plays back at up to 48 kHz on a stock Commodore 64 using the SID chip's D418 volume register technique.
 
 This Python script replicates and extends the work of **Antonio Savona (tonysavon)**, who created the original 48 kHz HiFi digital music players for the C64:
 
@@ -32,8 +32,8 @@ The playback loop is cycle-exact — every path between consecutive D418 writes 
 
   | Quality | Cycles | Sample Rate | Max Duration | Player Design |
   |---------|--------|-------------|--------------|---------------|
-  | 1 (default) | 21 | ~47 kHz | ~83 s | 60 unrolled play blocks |
-  | 2 | 41 | ~24 kHz | ~161 s | Unrolled blocks + JSR delay |
+  | 1 (default) | 21 | ~48 kHz | ~83 s | 60 unrolled play blocks |
+  | 2 | 42 | ~24 kHz | ~161 s | Unrolled blocks + JSR delay |
   | 3 | 63 | ~16 kHz | ~248 s | Unrolled blocks + JSR delay |
 
 - **Cycle-exact timing** on all 5 inter-sample paths (verified)
@@ -106,4 +106,3 @@ python c64_easyflash_encoder.py concert.mp4 concert.crt --quality 2
 
 - **Antonio Savona (tonysavon)** — original 48 kHz VQ player design and encoder algorithm
 - **Pex "Mahoney" Tufvesson** — SID D418 8-bit sample playback technique and amplitude measurements
-- **Encoder script** — developed with assistance from Claude (Anthropic)
